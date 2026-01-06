@@ -586,7 +586,11 @@ class EmiliaDataset(IterableDataset):
             num_shards: Number of shards to use (default: 50).
             language: Language subset to use (default: EN).
         """
+        logger.debug(f"[EmiliaDataset.__init__] START - language={language}, num_shards={num_shards}")
+        logger.debug(f"[EmiliaDataset.__init__] fetch_timeout={fetch_timeout}s, max_samples={max_samples}")
+        
         if not HAS_DATASETS:
+            logger.error("[EmiliaDataset.__init__] datasets library not installed!")
             raise ImportError("datasets library required: pip install datasets")
         
         self.feature_extractor = feature_extractor
@@ -595,6 +599,7 @@ class EmiliaDataset(IterableDataset):
         self.fetch_timeout = fetch_timeout
         self._is_first_sample = True
         self._samples_fetched = 0
+        self._init_timestamp = time.time()
         
         # Generate shard patterns for limited download
         shard_patterns = [f"Emilia/{language}/{language}-B0000{i:02d}.tar" for i in range(num_shards)]
@@ -602,19 +607,32 @@ class EmiliaDataset(IterableDataset):
         logger.info(f"Loading Emilia dataset: {num_shards} shards of {language}")
         logger.info(f"Shard range: {shard_patterns[0]} to {shard_patterns[-1]}")
         logger.info(f"Fetch timeout: {fetch_timeout}s per sample, {self.FIRST_SAMPLE_TIMEOUT}s for first sample")
+        logger.debug(f"[EmiliaDataset.__init__] All shard patterns: {shard_patterns}")
         
         # Load Emilia in streaming mode with specific shards
         # CRITICAL: Use .decode(False) to globally disable torchcodec audio decoding
         # This returns raw bytes/paths which we decode manually with soundfile
-        dataset = load_dataset(
-            "amphion/Emilia-Dataset",
-            split=split,
-            streaming=True,
-            data_files=shard_patterns,
-        )
+        logger.debug("[EmiliaDataset.__init__] Calling load_dataset() with streaming=True...")
+        load_start = time.time()
+        try:
+            dataset = load_dataset(
+                "amphion/Emilia-Dataset",
+                split=split,
+                streaming=True,
+                data_files=shard_patterns,
+            )
+            load_duration = time.time() - load_start
+            logger.debug(f"[EmiliaDataset.__init__] load_dataset() completed in {load_duration:.2f}s")
+        except Exception as e:
+            logger.exception(f"[EmiliaDataset.__init__] load_dataset() FAILED: {e}")
+            raise
         
         # Disable all automatic feature decoding (bypasses torchcodec completely)
+        logger.debug("[EmiliaDataset.__init__] Applying .decode(False) to disable auto-decoding...")
         self.dataset = dataset.decode(False)
+        
+        init_total = time.time() - self._init_timestamp
+        logger.debug(f"[EmiliaDataset.__init__] COMPLETE - total init time: {init_total:.2f}s")
     
     def _iter_with_timeout(self):
         """Iterate over dataset with timeout detection.
@@ -628,49 +646,121 @@ class EmiliaDataset(IterableDataset):
         import threading
         import queue
         
+        logger.debug("[_iter_with_timeout] START - initializing thread infrastructure")
+        iter_start_time = time.time()
+        
         sample_queue = queue.Queue(maxsize=1)
         error_queue = queue.Queue(maxsize=1)
         stop_event = threading.Event()
+        fetch_started_event = threading.Event()
+        
+        # Thread-safe counters for debugging
+        thread_stats = {
+            "samples_put": 0,
+            "thread_started": False,
+            "thread_ended": False,
+            "thread_error": None,
+            "last_sample_time": None,
+        }
         
         def fetch_samples():
             """Background thread to fetch samples."""
+            thread_stats["thread_started"] = True
+            logger.debug("[fetch_samples] THREAD STARTED - beginning iteration over self.dataset")
+            fetch_started_event.set()
+            
             try:
+                sample_count = 0
                 for sample in self.dataset:
                     if stop_event.is_set():
+                        logger.debug(f"[fetch_samples] STOP EVENT received after {sample_count} samples")
                         break
+                    
+                    sample_count += 1
+                    thread_stats["samples_put"] = sample_count
+                    thread_stats["last_sample_time"] = time.time()
+                    
+                    # Debug breadcrumb for first few samples and periodic updates
+                    if sample_count <= 5 or sample_count % 100 == 0:
+                        sample_keys = list(sample.keys()) if isinstance(sample, dict) else "<non-dict>"
+                        logger.debug(f"[fetch_samples] Sample #{sample_count} fetched, keys={sample_keys}")
+                    
                     sample_queue.put(sample)
+                    logger.debug(f"[fetch_samples] Sample #{sample_count} PUT to queue")
+                    
+                logger.debug(f"[fetch_samples] THREAD ITERATION COMPLETE - {sample_count} samples total")
+                
             except Exception as e:
+                thread_stats["thread_error"] = str(e)
+                logger.exception(f"[fetch_samples] THREAD EXCEPTION: {e}")
                 error_queue.put(e)
+            finally:
+                thread_stats["thread_ended"] = True
+                logger.debug(f"[fetch_samples] THREAD EXITING - stats: {thread_stats}")
         
-        fetch_thread = threading.Thread(target=fetch_samples, daemon=True)
+        fetch_thread = threading.Thread(target=fetch_samples, daemon=True, name="EmiliaFetchThread")
+        logger.debug(f"[_iter_with_timeout] Starting fetch thread (daemon=True)")
         fetch_thread.start()
         
+        # Wait for thread to actually start
+        thread_wait_start = time.time()
+        if not fetch_started_event.wait(timeout=10.0):
+            logger.warning("[_iter_with_timeout] Fetch thread did not signal start within 10s!")
+        else:
+            logger.debug(f"[_iter_with_timeout] Fetch thread started in {time.time() - thread_wait_start:.2f}s")
+        
+        samples_yielded = 0
         try:
             while True:
                 # Use longer timeout for first sample (initial connection)
                 timeout = self.FIRST_SAMPLE_TIMEOUT if self._is_first_sample else self.fetch_timeout
                 
+                if self._is_first_sample:
+                    logger.debug(f"[_iter_with_timeout] Waiting for FIRST sample (timeout={timeout}s)...")
+                    logger.debug(f"[_iter_with_timeout] Thread alive: {fetch_thread.is_alive()}, stats: {thread_stats}")
+                elif samples_yielded % 50 == 0:
+                    logger.debug(f"[_iter_with_timeout] Yielded {samples_yielded} samples so far, thread stats: {thread_stats}")
+                
+                wait_start = time.time()
                 try:
                     sample = sample_queue.get(timeout=timeout)
+                    wait_duration = time.time() - wait_start
+                    
+                    if self._is_first_sample:
+                        total_wait = time.time() - iter_start_time
+                        logger.info(f"[_iter_with_timeout] ✓ FIRST SAMPLE RECEIVED! Wait: {wait_duration:.2f}s, total: {total_wait:.2f}s")
+                    
                     self._is_first_sample = False
                     self._samples_fetched += 1
+                    samples_yielded += 1
                     yield sample
+                    
                 except queue.Empty:
+                    wait_duration = time.time() - wait_start
+                    logger.warning(f"[_iter_with_timeout] QUEUE TIMEOUT after {wait_duration:.2f}s (expected timeout: {timeout}s)")
+                    logger.warning(f"[_iter_with_timeout] Thread alive: {fetch_thread.is_alive()}, stats: {thread_stats}")
+                    
                     # Check if there was an error
                     if not error_queue.empty():
-                        raise error_queue.get()
+                        err = error_queue.get()
+                        logger.error(f"[_iter_with_timeout] Error from fetch thread: {err}")
+                        raise err
+                    
                     # Timeout occurred
                     if self._is_first_sample:
+                        logger.error(f"[_iter_with_timeout] FIRST SAMPLE TIMEOUT - network issue likely")
                         raise StreamingDataTimeout(
                             f"Timed out waiting for first sample after {timeout}s. "
                             f"Check network connection to HuggingFace Hub."
                         )
                     else:
+                        logger.error(f"[_iter_with_timeout] SAMPLE TIMEOUT after {self._samples_fetched} samples")
                         raise StreamingDataTimeout(
                             f"Timed out fetching sample after {timeout}s "
                             f"(fetched {self._samples_fetched} samples so far)"
                         )
         finally:
+            logger.debug(f"[_iter_with_timeout] CLEANUP - setting stop event, yielded {samples_yielded} samples")
             stop_event.set()
     
     def __iter__(self) -> Iterator[Dict[str, Any]]:
@@ -678,19 +768,34 @@ class EmiliaDataset(IterableDataset):
         import soundfile as sf
         
         count = 0
+        skipped_language = 0
+        skipped_no_audio = 0
+        skipped_errors = 0
+        iter_start_time = time.time()
+        
         logger.info("Starting to stream data from Emilia dataset...")
         logger.info("(First sample may take a few minutes to arrive due to network latency)")
+        logger.debug(f"[__iter__] Language filter: {self.languages}, max_samples: {self.max_samples}")
         
         for sample in self._iter_with_timeout():
-            # Log progress periodically
-            if count == 0:
+            raw_sample_idx = count + skipped_language + skipped_no_audio + skipped_errors
+            
+            # Log progress periodically with detailed debug
+            if count == 0 and raw_sample_idx == 0:
                 logger.info("✓ First sample received from streaming dataset!")
-            elif count % 100 == 0:
-                logger.debug(f"Streamed {count} samples so far...")
+                logger.debug(f"[__iter__] First raw sample keys: {list(sample.keys()) if isinstance(sample, dict) else 'N/A'}")
+            elif raw_sample_idx % 100 == 0:
+                elapsed = time.time() - iter_start_time
+                logger.debug(f"[__iter__] Progress: {count} yielded, {raw_sample_idx} raw samples, {elapsed:.1f}s elapsed")
+                logger.debug(f"[__iter__] Skipped: language={skipped_language}, no_audio={skipped_no_audio}, errors={skipped_errors}")
             
             # Filter by language if specified
             # Emilia samples have 'language' field (e.g. 'zh', 'en')
-            if self.languages and sample.get("language") not in self.languages:
+            sample_lang = sample.get("language")
+            if self.languages and sample_lang not in self.languages:
+                skipped_language += 1
+                if skipped_language <= 5 or skipped_language % 100 == 0:
+                    logger.debug(f"[__iter__] Skipping sample with language='{sample_lang}' (filter: {self.languages})")
                 continue
             
             try:
@@ -699,10 +804,22 @@ class EmiliaDataset(IterableDataset):
                 audio_bytes = audio_data.get("bytes")
                 
                 if audio_bytes is None:
+                    skipped_no_audio += 1
+                    if skipped_no_audio <= 5:
+                        logger.debug(f"[__iter__] Skipping sample with no audio bytes (audio_data keys: {list(audio_data.keys()) if isinstance(audio_data, dict) else 'N/A'})")
                     continue
                 
+                # Debug: log audio byte size for first few samples
+                if count < 5:
+                    logger.debug(f"[__iter__] Sample #{count}: audio_bytes size = {len(audio_bytes)} bytes")
+                
                 # Decode audio bytes using soundfile (no FFmpeg needed)
+                decode_start = time.time()
                 audio, sr = sf.read(io.BytesIO(audio_bytes))
+                decode_duration = time.time() - decode_start
+                
+                if count < 5:
+                    logger.debug(f"[__iter__] Sample #{count}: audio shape={audio.shape}, sr={sr}, decode_time={decode_duration:.3f}s")
                 
                 # Handle stereo -> mono
                 if len(audio.shape) > 1:
@@ -711,16 +828,23 @@ class EmiliaDataset(IterableDataset):
                 text = sample.get("text", "")
                 speaker_id = sample.get("speaker", "unknown")
                 
+                if count < 5:
+                    logger.debug(f"[__iter__] Sample #{count}: text_len={len(text)}, speaker={speaker_id}")
+                
                 # Convert to tensor
                 audio_tensor = torch.from_numpy(audio).float()
                 
                 if self.feature_extractor is not None:
                     # Save temp file and extract features
                     import tempfile
+                    feature_start = time.time()
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
                         torchaudio.save(f.name, audio_tensor.unsqueeze(0), sr)
                         features = self.feature_extractor.extract_audio_features(f.name)
                         text_tokens = self.feature_extractor.tokenize_text(text)
+                    feature_duration = time.time() - feature_start
+                    if count < 5:
+                        logger.debug(f"[__iter__] Sample #{count}: feature extraction took {feature_duration:.3f}s")
                 else:
                     # Dummy features for testing
                     seq_len = max(1, len(audio) // 320)  # Approximate tokens
@@ -729,6 +853,8 @@ class EmiliaDataset(IterableDataset):
                         "semantic_tokens": torch.randint(0, 8192, (seq_len,)),
                     }
                     text_tokens = torch.randint(0, 8192, (max(1, len(text) // 4),))
+                    if count < 5:
+                        logger.debug(f"[__iter__] Sample #{count}: using dummy features, seq_len={seq_len}")
                 
                 yield {
                     "text_tokens": text_tokens,
@@ -744,10 +870,16 @@ class EmiliaDataset(IterableDataset):
                     
             except Exception as e:
                 # Skip errors in streaming data
-                logger.debug(f"Skipping sample due to error: {e}")
+                skipped_errors += 1
+                if skipped_errors <= 10:
+                    logger.warning(f"[__iter__] Skipping sample due to error #{skipped_errors}: {e}")
+                elif skipped_errors % 100 == 0:
+                    logger.warning(f"[__iter__] Skipped {skipped_errors} samples due to errors")
                 continue
         
-        logger.info(f"Finished streaming {count} samples from Emilia dataset")
+        total_elapsed = time.time() - iter_start_time
+        logger.info(f"Finished streaming {count} samples from Emilia dataset in {total_elapsed:.1f}s")
+        logger.info(f"Skip summary: language={skipped_language}, no_audio={skipped_no_audio}, errors={skipped_errors}")
 
 
 class ESDDataset(Dataset):
@@ -1353,10 +1485,12 @@ class DurationTrainer:
             dataset_type = getattr(self.config, "dataset_type", "local")
             
             if dataset_type == "emilia":
+                logger.debug(f"[train] Creating EmiliaDataset with lang={getattr(self.config, 'emilia_lang', 'EN')}, shards={getattr(self.config, 'emilia_shards', 50)}")
                 if self.config.stage == 2:
                     logger.warning("Emilia is for Stage 1/3 (not emotional). Using Stage 2 ESD might be better.")
                 
                 # Emilia is IterableDataset
+                dataset_create_start = time.perf_counter()
                 dataset = EmiliaDataset(
                     feature_extractor=feature_extractor,
                     language=getattr(self.config, 'emilia_lang', 'EN'),
@@ -1364,6 +1498,8 @@ class DurationTrainer:
                     split="train",
                     max_samples=10000 if self.config.debug else None,
                 )
+                dataset_create_duration = time.perf_counter() - dataset_create_start
+                logger.debug(f"[train] EmiliaDataset created in {dataset_create_duration:.2f}s")
                 # Dataloader for IterableDataset
                 # NOTE: num_workers=0 required for streaming datasets on Windows
                 # due to multiprocessing spawn pickle issues with complex objects
@@ -1453,30 +1589,50 @@ class DurationTrainer:
             tokens_processed = 0
             is_streaming = isinstance(dataset, IterableDataset)
             first_batch_received = False
+            
+            logger.debug(f"[train] Starting training loop - is_streaming={is_streaming}")
+            logger.debug(f"[train] Dataloader config: batch_size={self.config.batch_size}, workers={self.config.num_workers}")
 
             for self.epoch in range(self.epoch, self.config.num_epochs):
                 # Log start of epoch
                 logger.info(f"Starting epoch {self.epoch + 1}/{self.config.num_epochs}")
+                epoch_start_time = time.perf_counter()
                 
                 if is_streaming and not first_batch_received:
                     # Show buffering message for streaming datasets
                     logger.info("Waiting for first batch from streaming dataset...")
                     logger.info("(This may take several minutes due to network latency)")
+                    logger.debug("[train] About to enter 'for batch in dataloader' loop...")
                     self.ui.console.print(
                         f"\n[cyan]⟳[/cyan] [bold]Buffering streaming data...[/bold]\n"
                         f"[dim]Connecting to HuggingFace Hub. First batch may take a few minutes.[/dim]\n"
                     )
                 
+                batch_idx = 0
+                logger.debug(f"[train] Creating dataloader iterator for epoch {self.epoch + 1}...")
+                dataloader_iter_start = time.perf_counter()
+                
                 for batch in dataloader:
+                    batch_idx += 1
+                    
                     # Log first batch received
                     if not first_batch_received:
                         first_batch_received = True
                         batch_fetch_time = time.perf_counter() - start_time
                         logger.info(f"✓ First batch received! (took {batch_fetch_time:.1f}s)")
+                        logger.debug(f"[train] First batch keys: {list(batch.keys())}")
+                        logger.debug(f"[train] First batch shapes: semantic_tokens={batch['semantic_tokens'].shape}")
                         self.ui.console.print(
                             f"[green]✓[/green] First batch received after {batch_fetch_time:.1f}s - training started!\n"
                         )
+                    
+                    # Periodic debug logging
+                    if batch_idx % 50 == 0:
+                        elapsed = time.perf_counter() - epoch_start_time
+                        logger.debug(f"[train] Epoch {self.epoch+1}, batch {batch_idx}: {elapsed:.1f}s elapsed")
+                    
                     if self.should_stop:
+                        logger.debug(f"[train] should_stop=True at batch {batch_idx}")
                         break
 
                     while self.is_paused:
