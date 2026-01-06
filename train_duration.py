@@ -572,6 +572,8 @@ class EmiliaDataset(IterableDataset):
         split: str = "train",
         max_samples: Optional[int] = None,
         fetch_timeout: int = 60,
+        num_shards: int = 50,
+        language: str = "EN",
     ) -> None:
         """Initialize Emilia streaming dataset.
         
@@ -581,27 +583,34 @@ class EmiliaDataset(IterableDataset):
             split: Dataset split.
             max_samples: Maximum samples to yield.
             fetch_timeout: Timeout in seconds for fetching samples.
+            num_shards: Number of shards to use (default: 50).
+            language: Language subset to use (default: EN).
         """
         if not HAS_DATASETS:
             raise ImportError("datasets library required: pip install datasets")
         
         self.feature_extractor = feature_extractor
-        self.languages = languages or ["zh", "en"]
+        self.languages = languages or [language.lower()]
         self.max_samples = max_samples
         self.fetch_timeout = fetch_timeout
         self._is_first_sample = True
         self._samples_fetched = 0
         
-        logger.info(f"Loading Emilia dataset (streaming: amphion/Emilia-Dataset) - languages: {self.languages}")
+        # Generate shard patterns for limited download
+        shard_patterns = [f"Emilia/{language}/{language}-B0000{i:02d}.tar" for i in range(num_shards)]
+        
+        logger.info(f"Loading Emilia dataset: {num_shards} shards of {language}")
+        logger.info(f"Shard range: {shard_patterns[0]} to {shard_patterns[-1]}")
         logger.info(f"Fetch timeout: {fetch_timeout}s per sample, {self.FIRST_SAMPLE_TIMEOUT}s for first sample")
         
-        # Load Emilia in streaming mode
+        # Load Emilia in streaming mode with specific shards
         # CRITICAL: Use .decode(False) to globally disable torchcodec audio decoding
         # This returns raw bytes/paths which we decode manually with soundfile
         dataset = load_dataset(
             "amphion/Emilia-Dataset",
             split=split,
             streaming=True,
+            data_files=shard_patterns,
         )
         
         # Disable all automatic feature decoding (bypasses torchcodec completely)
@@ -1350,7 +1359,8 @@ class DurationTrainer:
                 # Emilia is IterableDataset
                 dataset = EmiliaDataset(
                     feature_extractor=feature_extractor,
-                    languages=["zh", "en", "ja", "ko", "fr", "de"], # Multilingual support
+                    language=getattr(self.config, 'emilia_lang', 'EN'),
+                    num_shards=getattr(self.config, 'emilia_shards', 50),
                     split="train",
                     max_samples=10000 if self.config.debug else None,
                 )
@@ -1364,7 +1374,7 @@ class DurationTrainer:
                     collate_fn=collate_fn,
                     pin_memory=torch.cuda.is_available(),
                 )
-                logger.info("Using Emilia (Streaming) Dataset")
+                logger.info(f"Using Emilia (Streaming) Dataset: {getattr(self.config, 'emilia_shards', 50)} shards")
                 
             elif dataset_type == "esd":
                 dataset = ESDDataset(
@@ -1568,6 +1578,81 @@ class DurationTrainer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DATASET DOWNLOAD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def download_emilia_dataset(
+    num_shards: int = 50,
+    language: str = "EN",
+    cache_dir: Optional[str] = None,
+) -> None:
+    """Download Emilia dataset shards for offline/HPC use.
+    
+    Pre-downloads specified number of shards from the Emilia dataset
+    to the HuggingFace cache for offline training.
+    
+    Args:
+        num_shards: Number of shards to download (default: 50).
+        language: Language subset (EN, ZH, JA, KO, FR, DE).
+        cache_dir: Optional custom cache directory.
+        
+    Raises:
+        ImportError: If huggingface_hub is not installed.
+        
+    Example:
+        >>> download_emilia_dataset(num_shards=50, language="EN")
+        Downloading 50 shards of Emilia-EN...
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        raise ImportError("huggingface_hub required: pip install huggingface_hub")
+    
+    from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn
+    
+    console = Console()
+    
+    # Generate shard patterns
+    # Format: Emilia/EN/EN-B000000.tar to EN-B000049.tar (for 50 shards)
+    patterns = [f"Emilia/{language}/{language}-B0000{i:02d}.tar" for i in range(num_shards)]
+    
+    console.print(f"\n[bold cyan]Emilia Dataset Downloader[/bold cyan]")
+    console.print(f"[dim]─" * 50 + "[/dim]")
+    console.print(f"  Language: [bold]{language}[/bold]")
+    console.print(f"  Shards:   [bold]{num_shards}[/bold]")
+    console.print(f"  Pattern:  [dim]{patterns[0]}[/dim] ... [dim]{patterns[-1]}[/dim]")
+    console.print(f"[dim]─" * 50 + "[/dim]\n")
+    
+    console.print("[yellow]⚠[/yellow] Make sure you have access to the gated dataset:")
+    console.print("  [link]https://huggingface.co/datasets/amphion/Emilia-Dataset[/link]\n")
+    console.print("[dim]Run 'huggingface-cli login' if you haven't authenticated.[/dim]\n")
+    
+    try:
+        console.print("[cyan]⟳[/cyan] Starting download...")
+        
+        result = snapshot_download(
+            repo_id="amphion/Emilia-Dataset",
+            repo_type="dataset",
+            allow_patterns=patterns,
+            cache_dir=cache_dir,
+        )
+        
+        console.print(f"\n[green]✓[/green] [bold]Download complete![/bold]")
+        console.print(f"  Cache location: [dim]{result}[/dim]")
+        console.print(f"\n[dim]You can now run training with --dataset emilia[/dim]\n")
+        
+    except Exception as e:
+        console.print(f"\n[red]✗[/red] Download failed: {e}")
+        console.print("\n[yellow]Troubleshooting:[/yellow]")
+        console.print("  1. Run: [bold]huggingface-cli login[/bold]")
+        console.print("  2. Request access at: [link]https://huggingface.co/datasets/amphion/Emilia-Dataset[/link]")
+        console.print("  3. Check your internet connection")
+        raise
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1592,6 +1677,10 @@ def main() -> None:
     parser.add_argument(
         "--dataset", type=str, default="local", choices=["local", "emilia", "esd"],
         help="Dataset type: local (folder), emilia (streaming HF), esd (emotional)"
+    )
+    parser.add_argument(
+        "--emilia-shards", type=int, default=50,
+        help="Number of Emilia shards to use (default: 50)"
     )
 
     # Hyperparameters
@@ -1627,6 +1716,16 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--dry-run", action="store_true", help="Run one step only")
     parser.add_argument("--demo-ui", action="store_true", help="Demo UI only")
+    
+    # Dataset download
+    parser.add_argument(
+        "--download-emilia", type=int, default=None, metavar="N",
+        help="Download first N shards of Emilia-EN dataset and exit (e.g., --download-emilia 50)"
+    )
+    parser.add_argument(
+        "--emilia-lang", type=str, default="EN", choices=["EN", "ZH", "JA", "KO", "FR", "DE"],
+        help="Language subset for Emilia download (default: EN)"
+    )
 
     args = parser.parse_args()
 
@@ -1634,6 +1733,14 @@ def main() -> None:
     if args.demo_ui:
         from training_ui import demo_ui
         demo_ui()
+        return
+    
+    # Download Emilia dataset mode
+    if args.download_emilia is not None:
+        download_emilia_dataset(
+            num_shards=args.download_emilia,
+            language=args.emilia_lang,
+        )
         return
 
     # Create config
@@ -1657,8 +1764,10 @@ def main() -> None:
         seed=args.seed,
         num_workers=args.workers,
     )
-    # Inject dataset type into config
+    # Inject dataset type and emilia settings into config
     setattr(config, "dataset_type", args.dataset)
+    setattr(config, "emilia_shards", args.emilia_shards)
+    setattr(config, "emilia_lang", args.emilia_lang)
 
     # Create trainer
     trainer = DurationTrainer(config)
