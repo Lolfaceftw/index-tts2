@@ -1,0 +1,101 @@
+# IndexTTS2 Duration Control Training Configuration
+# Based on paper hyperparameters (Section: Training Hyperparameter Details)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Training Stage Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 1: Base training with duration embedding
+# Stage 2: Emotion control with GRL (train on emotional subset)
+# Stage 3: Fine-tuning with frozen conditioners
+
+stage: 1
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Paths
+# ═══════════════════════════════════════════════════════════════════════════════
+
+data_dir: "./data"                    # Training data directory
+model_dir: "./checkpoints"            # Pretrained model weights
+checkpoint_dir: "./checkpoints/training"  # Training checkpoints output
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hyperparameters (from paper)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Optimizer: AdamW with lr=2e-4 (paper: Section Training Hyperparameter Details)
+learning_rate: 2.0e-4
+weight_decay: 0.01
+betas: [0.9, 0.95]
+
+# Training duration: ~3 weeks on 8x A100 80GB
+batch_size: 4                         # Per-GPU batch size
+gradient_accumulation_steps: 8        # Effective batch = 32
+num_epochs: 100
+max_steps: null                       # Set to limit total steps
+
+# Duration control (paper: lines 48-49)
+# "p is randomly set to zero with a probability of 30%"
+duration_dropout: 0.3
+
+# Emotion adversarial loss coefficient (paper: line 54)
+# "α is the loss coefficient"
+emotion_loss_alpha: 1.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Checkpointing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+save_interval: 500                    # Save every N steps
+max_checkpoints: 5                    # Keep last N checkpoints (+ best)
+eval_interval: 1000                   # Evaluate every N steps
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Performance
+# ═══════════════════════════════════════════════════════════════════════════════
+
+use_fp16: true                        # Mixed precision training
+use_torch_compile: false              # Enable torch.compile (experimental)
+num_workers: 4                        # DataLoader workers
+pin_memory: true
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data Augmentation (paper: line 46)
+# "Random speed perturbation with coefficients r1 and r2"
+# ═══════════════════════════════════════════════════════════════════════════════
+
+speed_perturbation:
+  enabled: true
+  min_rate: 0.9
+  max_rate: 1.1
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage-Specific Overrides
+# ═══════════════════════════════════════════════════════════════════════════════
+
+stage1:
+  # Base training on full dataset
+  data_subset: null                   # Use all data
+  freeze_speaker_perceiver: false
+  freeze_emotion_perceiver: false
+
+stage2:
+  # Train on curated emotional subset (paper: "135 hours of high-quality emotional speech")
+  data_subset: "emotional"            # Use emotional subset only
+  freeze_speaker_perceiver: true      # Freeze speaker conditioner
+  freeze_emotion_perceiver: false     # Train emotion perceiver
+  use_grl: true                       # Enable gradient reversal
+
+stage3:
+  # Fine-tune on full dataset
+  data_subset: null                   # Use all data
+  freeze_speaker_perceiver: true      # Freeze all conditioners
+  freeze_emotion_perceiver: true
+  learning_rate: 5.0e-5               # Lower LR for fine-tuning
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Logging & Debug
+# ═══════════════════════════════════════════════════════════════════════════════
+
+debug: false
+log_interval: 10                      # Log metrics every N steps
+seed: 42

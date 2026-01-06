@@ -5,6 +5,7 @@ os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
 import json
 import re
 import time
+import logging
 import librosa
 import torch
 import torchaudio
@@ -353,19 +354,45 @@ class IndexTTS2:
 
         return emo_vector
 
+    # Token rate for duration control
+    # Empirically derived from the full pipeline:
+    # - GPT generates semantic tokens
+    # - S2M converts tokens->mel with 1.72x multiplier: mel_frames = tokens * 1.72
+    # - BigVGAN vocoder: audio_samples = mel_frames * hop_size (256)
+    # - sample_rate = 22050
+    # So: duration = tokens * 1.72 * 256 / 22050
+    # Therefore: tokens/second = 22050 / (1.72 * 256) ≈ 50.08
+    TOKENS_PER_SECOND = 50.077217
+
+    def duration_to_tokens(self, duration_seconds: float) -> int:
+        """Convert target duration in seconds to target token count.
+        
+        Args:
+            duration_seconds: Target speech duration in seconds.
+            
+        Returns:
+            Token count for duration control.
+        """
+        logger = logging.getLogger('indextts.duration')
+        tokens = int(duration_seconds * self.TOKENS_PER_SECOND)
+        logger.debug(f"duration_to_tokens: {duration_seconds}s * {self.TOKENS_PER_SECOND} = {tokens} tokens")
+        return tokens
+
     # 原始推理模式
     def infer(self, spk_audio_prompt, text, output_path,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
+              target_duration=None, target_tokens=None, **generation_kwargs):
         if stream_return:
             return self.infer_generator(
                 spk_audio_prompt, text, output_path,
                 emo_audio_prompt, emo_alpha,
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
-                verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                target_duration=target_duration, target_tokens=target_tokens, **generation_kwargs
             )
         else:
             try:
@@ -374,7 +401,8 @@ class IndexTTS2:
                     emo_audio_prompt, emo_alpha,
                     emo_vector,
                     use_emo_text, emo_text, use_random, interval_silence,
-                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                    target_duration=target_duration, target_tokens=target_tokens, **generation_kwargs
                 ))[0]
             except IndexError:
                 return None
@@ -383,9 +411,33 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
+              target_duration=None, target_tokens=None, **generation_kwargs):
+        """
+        Generate speech from text with optional duration control.
+        
+        Args:
+            target_duration: Target speech duration in seconds. If specified, enables duration control.
+            target_tokens: Target token count (overrides target_duration if both specified).
+            ... (other args same as before)
+        """
+        logger = logging.getLogger('indextts.duration')
+        logger.debug(f"infer_generator called: target_duration={target_duration}, target_tokens={target_tokens}")
+        
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
+        
+        # Handle duration control
+        computed_target_tokens = None
+        if target_tokens is not None:
+            computed_target_tokens = target_tokens
+            logger.debug(f"Using explicit target_tokens={computed_target_tokens}")
+            print(f">> Duration control: using target_tokens={computed_target_tokens}")
+        elif target_duration is not None:
+            computed_target_tokens = self.duration_to_tokens(target_duration)
+            logger.debug(f"Converted target_duration={target_duration}s to {computed_target_tokens} tokens")
+            print(f">> Duration control: target_duration={target_duration}s -> target_tokens={computed_target_tokens}")
+        
         if verbose:
             print(f"origin text:{text}, spk_audio_prompt:{spk_audio_prompt}, "
                   f"emo_audio_prompt:{emo_audio_prompt}, emo_alpha:{emo_alpha}, "
@@ -577,8 +629,13 @@ class IndexTTS2:
                         num_beams=num_beams,
                         repetition_penalty=repetition_penalty,
                         max_generate_length=max_mel_tokens,
+                        target_tokens=computed_target_tokens,
                         **generation_kwargs
                     )
+                    
+                    # Debug: log generated codes info
+                    logger.debug(f"GPT returned codes shape: {codes.shape}")
+                    logger.debug(f"Requested target_tokens: {computed_target_tokens}, Got: {codes.shape[-1]} tokens")
 
                 gpt_gen_time += time.perf_counter() - m_start_time
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
@@ -609,6 +666,10 @@ class IndexTTS2:
                 codes = codes[:, :max_code_len]
                 code_lens = torch.LongTensor(code_lens)
                 code_lens = code_lens.to(self.device)
+                
+                # Debug: log final code lengths after stop token processing
+                logger.debug(f"After stop-token processing: code_lens={code_lens.tolist()}, max_code_len={max_code_len}")
+                
                 if verbose:
                     print(codes, type(codes))
                     print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
@@ -641,6 +702,13 @@ class IndexTTS2:
                     S_infer = S_infer.transpose(1, 2)
                     S_infer = S_infer + latent
                     target_lengths = (code_lens * 1.72).long()
+                    
+                    # Debug: log S2M conversion
+                    logger.debug(f"S2M: code_lens={code_lens.tolist()}, target_lengths (mel frames)={target_lengths.tolist()}")
+                    # Expected duration = mel_frames * hop_size / sample_rate
+                    # hop_size=256, sample_rate=22050 -> mel_frames * 256 / 22050
+                    expected_duration = target_lengths[0].item() * 256 / 22050
+                    logger.debug(f"S2M: expected audio duration from mel frames: {expected_duration:.2f}s")
 
                     cond = self.s2mel.models['length_regulator'](S_infer,
                                                                  ylens=target_lengths,
@@ -654,10 +722,13 @@ class IndexTTS2:
                                                                    inference_cfg_rate=inference_cfg_rate)
                     vc_target = vc_target[:, :, ref_mel.size(-1):]
                     s2mel_time += time.perf_counter() - m_start_time
+                    
+                    logger.debug(f"S2M: vc_target (mel) shape: {vc_target.shape}")
 
                     m_start_time = time.perf_counter()
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
                     print(wav.shape)
+                    logger.debug(f"BigVGAN: wav shape: {wav.shape}, duration: {wav.shape[-1]/22050:.2f}s")
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 

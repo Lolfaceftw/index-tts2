@@ -1,4 +1,5 @@
 import functools
+import logging
 
 import torch
 import torch.nn as nn
@@ -696,7 +697,7 @@ class UnifiedVoice(nn.Module):
         return fake_inputs, batched_mel_emb, attention_mask
 
     def inference_speech(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False, input_tokens=None, num_return_sequences=1,
-                         max_generate_length=None, typical_sampling=False, typical_mass=.9, **hf_generate_kwargs):
+                         max_generate_length=None, typical_sampling=False, typical_mass=.9, target_tokens=None, **hf_generate_kwargs):
         """
         Args:
             speech_condition: (b, d, frames) or (d, frames)
@@ -704,8 +705,12 @@ class UnifiedVoice(nn.Module):
             cond_mel_lengths: lengths of the conditioning mel spectrograms in shape (b,) or (1,)
             input_tokens: additional tokens for generation in shape (b, s) or (s,)
             max_generate_length: limit the number of generated tokens
+            target_tokens: if specified, enables duration control by injecting mel position embedding for target token count
             hf_generate_kwargs: kwargs for `GPT2InferenceModel.generate(**hf_generate_kwargs)`
         """
+        logger = logging.getLogger('indextts.duration')
+        logger.debug(f"inference_speech called: target_tokens={target_tokens}, max_generate_length={max_generate_length}")
+        logger.debug(f"max_mel_tokens={self.max_mel_tokens}")
 
         if speech_condition.ndim == 2:
             speech_condition = speech_condition.unsqueeze(0)
@@ -726,8 +731,24 @@ class UnifiedVoice(nn.Module):
             print('Use the specified emotion vector')
 
         tmp = torch.zeros(text_inputs.size(0)).to(text_inputs.device)
-        duration_emb =  self.speed_emb(torch.zeros_like(tmp).long())
-        duration_emb_half = self.speed_emb(torch.ones_like(tmp).long())
+        duration_emb = self.speed_emb(torch.zeros_like(tmp).long())
+        
+        # Duration control: inject mel position embedding for target token count
+        if target_tokens is not None:
+            # Per paper: p = Wnum * h(T), where Wnum == Wsem (mel_pos_embedding)
+            # Clamp to max_mel_tokens to prevent index out of bounds
+            original_target_tokens = target_tokens
+            target_tokens = min(target_tokens, self.max_mel_tokens - 1)
+            logger.debug(f"Duration control: original={original_target_tokens}, clamped={target_tokens} (max_mel_tokens={self.max_mel_tokens})")
+            duration_emb_half = self.mel_pos_embedding.emb(
+                torch.tensor([target_tokens], device=text_inputs.device)
+            ).expand(text_inputs.size(0), -1)  # (b, dim)
+            print(f'Duration control: target_tokens={target_tokens}')
+        else:
+            # Free-form mode: use zero embedding (speed_emb(1) initialized to zeros)
+            duration_emb_half = self.speed_emb(torch.ones_like(tmp).long())
+            logger.debug("Duration control: disabled (free-form mode)")
+        
         conds_latent = torch.cat((speech_conditioning_latent + emo_vec.unsqueeze(1), duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)), 1)
         input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(conds_latent, text_inputs)
         self.inference_model.store_mel_emb(inputs_embeds)
@@ -748,6 +769,8 @@ class UnifiedVoice(nn.Module):
             inputs = torch.cat([input_ids, input_tokens], dim=1)
             attention_mask = F.pad(attention_mask, (0, input_tokens.shape[1]), value=1)
         trunc_index = inputs.shape[1]
+        logger.debug(f"trunc_index (prefix length)={trunc_index}, inputs.shape={inputs.shape}")
+        
         logits_processor = LogitsProcessorList()
         if typical_sampling:
             # employ custom typical sampling
@@ -756,30 +779,49 @@ class UnifiedVoice(nn.Module):
             min_tokens_to_keep = 2 if hf_generate_kwargs.get("num_beams", 1) > 1 else 1
             logits_processor.append(TypicalLogitsWarper(mass=typical_mass, min_tokens_to_keep=min_tokens_to_keep))
         max_length = (trunc_index + self.max_mel_tokens - 1) if max_generate_length is None else trunc_index + max_generate_length
+        logger.debug(f"Initial max_length={max_length} (before duration control override)")
+        
+        # If duration control is enabled, enforce exact token count
+        if target_tokens is not None:
+            max_length = trunc_index + target_tokens
+            logger.debug(f"Duration control: overriding max_length to {max_length} (trunc_index={trunc_index} + target_tokens={target_tokens})")
+        
+        # When duration control is active, disable early stopping (eos_token_id)
+        # so generation continues to exactly max_length tokens
+        use_eos_token = None if target_tokens is not None else self.stop_mel_token
+        use_stop_tokens = [] if target_tokens is not None else [self.stop_mel_token]
+        logger.debug(f"EOS config: use_eos_token={use_eos_token}, use_stop_tokens={use_stop_tokens}")
+        logger.debug(f"Final generation params: max_length={max_length}, expected_new_tokens={max_length - trunc_index}")
         
         # Use accel engine if available (single sequence only)
         if self.accel_engine is not None and num_return_sequences == 1:
+            logger.debug("Using accel_engine for generation")
             output = self.accel_engine.generate(
                 inputs,  # fake input_ids (all 1s + start_mel_token)
                 max_new_tokens=max_length - trunc_index,
                 attention_mask=attention_mask,
                 temperature=hf_generate_kwargs.get('temperature', 1),
-                stop_tokens=[self.stop_mel_token],
+                stop_tokens=use_stop_tokens,
                 tts_embeddings=inputs_embeds,  # [pad][cond][text] embeddings (87 tokens, NO start_mel_token)
                 tts_mel_embedding=self.inference_model.embeddings,  # mel_embedding layer
                 tts_text_pos_embedding=self.inference_model.text_pos_embedding,  # text_pos_embedding layer
             )
         else:
+            logger.debug("Using inference_model.generate (HuggingFace)")
             output = self.inference_model.generate(inputs, 
                                                 bos_token_id=self.start_mel_token, pad_token_id=self.stop_mel_token,
-                                                eos_token_id=self.stop_mel_token, attention_mask=attention_mask,
+                                                eos_token_id=use_eos_token, attention_mask=attention_mask,
                                                 max_length=max_length, logits_processor=logits_processor,
                                                 num_return_sequences=num_return_sequences,
                                                 **hf_generate_kwargs)
         if isinstance(output, torch.Tensor):
-            return output[:, trunc_index:], speech_conditioning_latent
+            generated_tokens = output[:, trunc_index:]
+            logger.debug(f"Generated output: total_shape={output.shape}, generated_tokens_shape={generated_tokens.shape}")
+            logger.debug(f"Actual generated token count: {generated_tokens.shape[1]}")
+            return generated_tokens, speech_conditioning_latent
         # GenerateOutput
         output.sequences = output.sequences[:, trunc_index:]
+        logger.debug(f"Generated sequences shape: {output.sequences.shape}, actual_token_count={output.sequences.shape[1]}")
         return output, speech_conditioning_latent
 
     def get_emovec(self, emo_speech_conditioning_latent, emo_cond_lengths):
