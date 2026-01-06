@@ -71,7 +71,7 @@ except ImportError:
     HAS_DATASETS = False
 
 from checkpoint_manager import CheckpointManager
-from training_ui import TrainingUI, show_loading_animation, ModelLoadingUI
+from training_ui import TrainingUI, show_loading_animation, ModelLoadingUI, BufferingSpinner
 from rich.console import Console
 
 try:
@@ -542,18 +542,28 @@ class LocalDurationDataset(Dataset):
         }
 
 
+class StreamingDataTimeout(Exception):
+    """Raised when streaming data fetch times out."""
+    pass
+
+
 class EmiliaDataset(IterableDataset):
-    """Streaming dataset for Emilia (HuggingFace).
+    """Streaming dataset for Emilia corpus from HuggingFace.
     
-    Emilia is a large-scale multilingual speech dataset with ~100K hours.
-    Dataset: amphion/Emilia-Dataset
+    Emilia dataset contains multi-lingual speech data for TTS training.
     Paper used 55K hours (30K Chinese + 25K English).
     
     Attributes:
         dataset: HuggingFace dataset in streaming mode.
         feature_extractor: Feature extractor instance.
         languages: List of languages to include.
+        fetch_timeout: Timeout in seconds for fetching each sample.
+        first_sample_timeout: Longer timeout for initial connection.
     """
+    
+    # Default timeouts (seconds)
+    DEFAULT_FETCH_TIMEOUT = 60  # Per-sample timeout
+    FIRST_SAMPLE_TIMEOUT = 300  # 5 minutes for initial connection
     
     def __init__(
         self,
@@ -561,6 +571,7 @@ class EmiliaDataset(IterableDataset):
         languages: Optional[List[str]] = None,
         split: str = "train",
         max_samples: Optional[int] = None,
+        fetch_timeout: int = 60,
     ) -> None:
         """Initialize Emilia streaming dataset.
         
@@ -569,6 +580,7 @@ class EmiliaDataset(IterableDataset):
             languages: Languages to filter (default: zh, en).
             split: Dataset split.
             max_samples: Maximum samples to yield.
+            fetch_timeout: Timeout in seconds for fetching samples.
         """
         if not HAS_DATASETS:
             raise ImportError("datasets library required: pip install datasets")
@@ -576,8 +588,12 @@ class EmiliaDataset(IterableDataset):
         self.feature_extractor = feature_extractor
         self.languages = languages or ["zh", "en"]
         self.max_samples = max_samples
+        self.fetch_timeout = fetch_timeout
+        self._is_first_sample = True
+        self._samples_fetched = 0
         
         logger.info(f"Loading Emilia dataset (streaming: amphion/Emilia-Dataset) - languages: {self.languages}")
+        logger.info(f"Fetch timeout: {fetch_timeout}s per sample, {self.FIRST_SAMPLE_TIMEOUT}s for first sample")
         
         # Load Emilia in streaming mode
         # CRITICAL: Use .decode(False) to globally disable torchcodec audio decoding
@@ -591,12 +607,78 @@ class EmiliaDataset(IterableDataset):
         # Disable all automatic feature decoding (bypasses torchcodec completely)
         self.dataset = dataset.decode(False)
     
+    def _iter_with_timeout(self):
+        """Iterate over dataset with timeout detection.
+        
+        Yields:
+            Samples from the underlying dataset.
+            
+        Raises:
+            StreamingDataTimeout: If sample fetch exceeds timeout.
+        """
+        import threading
+        import queue
+        
+        sample_queue = queue.Queue(maxsize=1)
+        error_queue = queue.Queue(maxsize=1)
+        stop_event = threading.Event()
+        
+        def fetch_samples():
+            """Background thread to fetch samples."""
+            try:
+                for sample in self.dataset:
+                    if stop_event.is_set():
+                        break
+                    sample_queue.put(sample)
+            except Exception as e:
+                error_queue.put(e)
+        
+        fetch_thread = threading.Thread(target=fetch_samples, daemon=True)
+        fetch_thread.start()
+        
+        try:
+            while True:
+                # Use longer timeout for first sample (initial connection)
+                timeout = self.FIRST_SAMPLE_TIMEOUT if self._is_first_sample else self.fetch_timeout
+                
+                try:
+                    sample = sample_queue.get(timeout=timeout)
+                    self._is_first_sample = False
+                    self._samples_fetched += 1
+                    yield sample
+                except queue.Empty:
+                    # Check if there was an error
+                    if not error_queue.empty():
+                        raise error_queue.get()
+                    # Timeout occurred
+                    if self._is_first_sample:
+                        raise StreamingDataTimeout(
+                            f"Timed out waiting for first sample after {timeout}s. "
+                            f"Check network connection to HuggingFace Hub."
+                        )
+                    else:
+                        raise StreamingDataTimeout(
+                            f"Timed out fetching sample after {timeout}s "
+                            f"(fetched {self._samples_fetched} samples so far)"
+                        )
+        finally:
+            stop_event.set()
+    
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         import io
         import soundfile as sf
         
         count = 0
-        for sample in self.dataset:
+        logger.info("Starting to stream data from Emilia dataset...")
+        logger.info("(First sample may take a few minutes to arrive due to network latency)")
+        
+        for sample in self._iter_with_timeout():
+            # Log progress periodically
+            if count == 0:
+                logger.info("✓ First sample received from streaming dataset!")
+            elif count % 100 == 0:
+                logger.debug(f"Streamed {count} samples so far...")
+            
             # Filter by language if specified
             # Emilia samples have 'language' field (e.g. 'zh', 'en')
             if self.languages and sample.get("language") not in self.languages:
@@ -648,12 +730,15 @@ class EmiliaDataset(IterableDataset):
                 
                 count += 1
                 if self.max_samples and count >= self.max_samples:
+                    logger.info(f"Reached max_samples limit: {self.max_samples}")
                     break
                     
             except Exception as e:
                 # Skip errors in streaming data
                 logger.debug(f"Skipping sample due to error: {e}")
                 continue
+        
+        logger.info(f"Finished streaming {count} samples from Emilia dataset")
 
 
 class ESDDataset(Dataset):
@@ -1356,9 +1441,31 @@ class DurationTrainer:
             self.model.train()
             start_time = time.perf_counter()
             tokens_processed = 0
+            is_streaming = isinstance(dataset, IterableDataset)
+            first_batch_received = False
 
             for self.epoch in range(self.epoch, self.config.num_epochs):
+                # Log start of epoch
+                logger.info(f"Starting epoch {self.epoch + 1}/{self.config.num_epochs}")
+                
+                if is_streaming and not first_batch_received:
+                    # Show buffering message for streaming datasets
+                    logger.info("Waiting for first batch from streaming dataset...")
+                    logger.info("(This may take several minutes due to network latency)")
+                    self.ui.console.print(
+                        f"\n[cyan]⟳[/cyan] [bold]Buffering streaming data...[/bold]\n"
+                        f"[dim]Connecting to HuggingFace Hub. First batch may take a few minutes.[/dim]\n"
+                    )
+                
                 for batch in dataloader:
+                    # Log first batch received
+                    if not first_batch_received:
+                        first_batch_received = True
+                        batch_fetch_time = time.perf_counter() - start_time
+                        logger.info(f"✓ First batch received! (took {batch_fetch_time:.1f}s)")
+                        self.ui.console.print(
+                            f"[green]✓[/green] First batch received after {batch_fetch_time:.1f}s - training started!\n"
+                        )
                     if self.should_stop:
                         break
 

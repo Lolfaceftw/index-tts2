@@ -758,6 +758,98 @@ class ModelLoadingUI:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# BUFFERING SPINNER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class BufferingSpinner:
+    """Animated spinner for showing data buffering progress.
+    
+    Shows a spinner with elapsed time while waiting for streaming data.
+    Use as context manager or call start()/stop() manually.
+    
+    Attributes:
+        console: Rich console instance.
+        message: Message to display.
+        start_time: When buffering started.
+        
+    Example:
+        >>> with BufferingSpinner("Waiting for data..."):
+        ...     data = fetch_data()  # Long operation
+    """
+    
+    def __init__(self, message: str = "Buffering streaming data...", console: Optional[Console] = None):
+        """Initialize buffering spinner.
+        
+        Args:
+            message: Message to display while waiting.
+            console: Rich console instance.
+        """
+        self.message = message
+        self.console = console or Console()
+        self.live = None
+        self.start_time = None
+        self._stop_flag = False
+        self._thread = None
+        
+    def __enter__(self):
+        self.start()
+        return self
+        
+    def __exit__(self, *args):
+        self.stop()
+        
+    def start(self) -> None:
+        """Start the buffering spinner animation."""
+        import threading
+        
+        self.start_time = time.perf_counter()
+        self._stop_flag = False
+        
+        # Use Rich's Progress for the spinner
+        self.progress = Progress(
+            SpinnerColumn(style=BRAND_COLOR),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=self.console,
+            transient=True,
+        )
+        self.progress.start()
+        self.task_id = self.progress.add_task(self.message, total=None)
+        
+    def stop(self, success: bool = True) -> None:
+        """Stop the buffering spinner.
+        
+        Args:
+            success: Whether the operation completed successfully.
+        """
+        if self.progress:
+            self.progress.stop()
+            elapsed = time.perf_counter() - self.start_time if self.start_time else 0
+            
+            if success:
+                self.console.print(
+                    f"[{SUCCESS_COLOR}]✓[/{SUCCESS_COLOR}] {self.message} "
+                    f"[dim]({elapsed:.1f}s)[/dim]"
+                )
+            else:
+                self.console.print(
+                    f"[{ERROR_COLOR}]✗[/{ERROR_COLOR}] {self.message} "
+                    f"[dim](failed after {elapsed:.1f}s)[/dim]"
+                )
+                
+    def update_message(self, message: str) -> None:
+        """Update the spinner message.
+        
+        Args:
+            message: New message to display.
+        """
+        self.message = message
+        if self.progress and self.task_id is not None:
+            self.progress.update(self.task_id, description=message)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN UI CLASS
 # ═══════════════════════════════════════════════════════════════════════════════
 
