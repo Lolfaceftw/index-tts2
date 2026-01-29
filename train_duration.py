@@ -1273,8 +1273,16 @@ class DurationTrainer:
     def _setup_signal_handlers(self) -> None:
         """Setup graceful shutdown handlers."""
 
+        self._signal_count = 0
+
         def handler(signum, frame):
-            logger.warning(f"Received signal {signum}, initiating graceful shutdown")
+            self._signal_count += 1
+            if self._signal_count >= 2:
+                logger.warning(f"Received signal {signum} again. Forcing exit...")
+                import sys
+                sys.exit(1)
+            
+            logger.warning(f"Received signal {signum}, initiating graceful shutdown... (Press Ctrl+C again to force exit)")
             self.should_stop = True
 
         signal.signal(signal.SIGINT, handler)
