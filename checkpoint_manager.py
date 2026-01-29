@@ -25,14 +25,14 @@ from typing import Any, Dict, List, Optional, Protocol, Union
 import numpy as np
 import torch
 
-from indextts.utils.logger import logger_manager
+from indextts.utils.logger import get_logger, logger_manager
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OBSERVABILITY SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-logger = logger_manager.get_logger()
+logger = get_logger()
 # Initialize with defaults if not already done, but usually done by the main script.
 if not logger.handlers:
     logger = logger_manager.setup(name="checkpoint_manager", log_file="checkpoint_manager.log")
@@ -273,7 +273,7 @@ class CheckpointManager:
                 level=logging.DEBUG
             )
         else:
-            logger = logger_manager.get_logger()
+            logger = get_logger()
 
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)

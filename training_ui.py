@@ -850,6 +850,132 @@ class BufferingSpinner:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# STREAMING PROGRESS UI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class StreamingProgressUI:
+    """Progress indicator for streaming dataset downloads.
+    
+    Shows samples fetched, elapsed time, and throughput in real-time.
+    Use as context manager or call start()/stop() manually.
+    
+    Attributes:
+        console: Rich console instance.
+        samples_fetched: Number of samples received.
+        start_time: When streaming started.
+        
+    Example:
+        >>> with StreamingProgressUI() as progress:
+        ...     for batch in dataloader:
+        ...         progress.update(samples=len(batch))
+    """
+    
+    def __init__(
+        self, 
+        message: str = "Streaming from HuggingFace...", 
+        console: Optional[Console] = None
+    ):
+        """Initialize streaming progress UI.
+        
+        Args:
+            message: Message to display while streaming.
+            console: Rich console instance.
+        """
+        self.message = message
+        self.console = console or Console()
+        self.progress = None
+        self.task_id = None
+        self.start_time = None
+        self.samples_fetched = 0
+        
+    def __enter__(self):
+        self.start()
+        return self
+        
+    def __exit__(self, *args):
+        self.stop()
+        
+    def start(self) -> None:
+        """Start the streaming progress display."""
+        self.start_time = time.perf_counter()
+        self.samples_fetched = 0
+        
+        self.progress = Progress(
+            SpinnerColumn(style=BRAND_COLOR),
+            TextColumn("[progress.description]{task.description}"),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TextColumn("[cyan]{task.fields[samples]}[/cyan] samples"),
+            TextColumn("•"),
+            TextColumn("[dim]{task.fields[throughput]}[/dim]"),
+            console=self.console,
+            transient=False,  # Keep visible after completion
+        )
+        self.progress.start()
+        self.task_id = self.progress.add_task(
+            self.message, 
+            total=None,
+            samples="0",
+            throughput="-- samples/s"
+        )
+        
+    def stop(self, success: bool = True) -> None:
+        """Stop the streaming progress display.
+        
+        Args:
+            success: Whether the operation completed successfully.
+        """
+        if self.progress:
+            self.progress.stop()
+            elapsed = time.perf_counter() - self.start_time if self.start_time else 0
+            throughput = self.samples_fetched / elapsed if elapsed > 0 else 0
+            
+            if success:
+                self.console.print(
+                    f"[{SUCCESS_COLOR}]✓[/{SUCCESS_COLOR}] Streaming ready! "
+                    f"[dim]{self.samples_fetched} samples in {elapsed:.1f}s "
+                    f"({throughput:.1f} samples/s)[/dim]"
+                )
+            else:
+                self.console.print(
+                    f"[{ERROR_COLOR}]✗[/{ERROR_COLOR}] Streaming failed "
+                    f"[dim](after {elapsed:.1f}s)[/dim]"
+                )
+                
+    def update(self, samples: int = 1) -> None:
+        """Update the progress with newly fetched samples.
+        
+        Args:
+            samples: Number of new samples fetched (added to total).
+        """
+        self.samples_fetched += samples
+        self._refresh_display()
+    
+    def set_samples(self, count: int) -> None:
+        """Set the sample count directly (for callbacks).
+        
+        Args:
+            count: Total number of samples fetched.
+        """
+        self.samples_fetched = count
+        self._refresh_display()
+    
+    def _refresh_display(self) -> None:
+        """Refresh the progress display with current values."""
+        elapsed = time.perf_counter() - self.start_time if self.start_time else 0
+        throughput = self.samples_fetched / elapsed if elapsed > 0 else 0
+        
+        if self.progress and self.task_id is not None:
+            self.progress.update(
+                self.task_id,
+                samples=str(self.samples_fetched),
+                throughput=f"{throughput:.1f} samples/s"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN UI CLASS
 # ═══════════════════════════════════════════════════════════════════════════════
 

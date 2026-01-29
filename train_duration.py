@@ -28,11 +28,16 @@ import argparse
 import functools
 import logging
 import os
+import random
+import signal
+import sys
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from indextts.utils.logger import logger_manager
+from indextts.utils.logger import get_logger, logger_manager
 
 import numpy as np
 import torch
@@ -67,7 +72,7 @@ except ImportError:
     HAS_DATASETS = False
 
 from checkpoint_manager import CheckpointManager
-from training_ui import TrainingUI, show_loading_animation, ModelLoadingUI, BufferingSpinner
+from training_ui import TrainingUI, show_loading_animation, ModelLoadingUI, BufferingSpinner, StreamingProgressUI, setup_observability
 from rich.console import Console
 
 try:
@@ -81,7 +86,7 @@ except ImportError:
 # OBSERVABILITY SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-logger = logger_manager.get_logger()
+logger = get_logger()
 
 
 def trace_execution(func):
@@ -539,6 +544,7 @@ class EmiliaDataset(IterableDataset):
         fetch_timeout: int = 60,
         num_shards: int = 50,
         language: str = "EN",
+        on_sample_callback: Optional[Callable[[int], None]] = None,
     ) -> None:
         """Initialize Emilia streaming dataset.
         
@@ -550,6 +556,7 @@ class EmiliaDataset(IterableDataset):
             fetch_timeout: Timeout in seconds for fetching samples.
             num_shards: Number of shards to use (default: 50).
             language: Language subset to use (default: EN).
+            on_sample_callback: Callback called with sample count when sample received.
         """
         logger.debug(f"[EmiliaDataset.__init__] START - language={language}, num_shards={num_shards}")
         logger.debug(f"[EmiliaDataset.__init__] fetch_timeout={fetch_timeout}s, max_samples={max_samples}")
@@ -562,6 +569,7 @@ class EmiliaDataset(IterableDataset):
         self.languages = languages or [language.lower()]
         self.max_samples = max_samples
         self.fetch_timeout = fetch_timeout
+        self.on_sample_callback = on_sample_callback
         self._is_first_sample = True
         self._samples_fetched = 0
         self._init_timestamp = time.time()
@@ -693,7 +701,7 @@ class EmiliaDataset(IterableDataset):
                     
                     if self._is_first_sample:
                         total_wait = time.time() - iter_start_time
-                        logger.info(f"[_iter_with_timeout] ✓ FIRST SAMPLE RECEIVED! Wait: {wait_duration:.2f}s, total: {total_wait:.2f}s")
+                        logger.info(f"[_iter_with_timeout] [OK] FIRST SAMPLE RECEIVED! Wait: {wait_duration:.2f}s, total: {total_wait:.2f}s")
                     
                     self._is_first_sample = False
                     self._samples_fetched += 1
@@ -745,9 +753,14 @@ class EmiliaDataset(IterableDataset):
         for sample in self._iter_with_timeout():
             raw_sample_idx = count + skipped_language + skipped_no_audio + skipped_errors
             
+            # Call progress callback on raw sample receipt (before processing)
+            # This shows samples as they arrive from HuggingFace
+            if self.on_sample_callback:
+                self.on_sample_callback(raw_sample_idx + 1)
+            
             # Log progress periodically with detailed debug
             if count == 0 and raw_sample_idx == 0:
-                logger.info("✓ First sample received from streaming dataset!")
+                logger.info("[OK] First sample received from streaming dataset!")
                 logger.debug(f"[__iter__] First raw sample keys: {list(sample.keys()) if isinstance(sample, dict) else 'N/A'}")
             elif raw_sample_idx % 100 == 0:
                 elapsed = time.time() - iter_start_time
@@ -829,6 +842,7 @@ class EmiliaDataset(IterableDataset):
                 }
                 
                 count += 1
+                
                 if self.max_samples and count >= self.max_samples:
                     logger.info(f"Reached max_samples limit: {self.max_samples}")
                     break
@@ -1449,10 +1463,24 @@ class DurationTrainer:
             use_emotional = self.config.stage == 2
             dataset_type = getattr(self.config, "dataset_type", "local")
             
+            # For streaming datasets, create progress UI first
+            streaming_progress = None
+            
             if dataset_type == "emilia":
                 logger.debug(f"[train] Creating EmiliaDataset with lang={getattr(self.config, 'emilia_lang', 'EN')}, shards={getattr(self.config, 'emilia_shards', 50)}")
                 if self.config.stage == 2:
                     logger.warning("Emilia is for Stage 1/3 (not emotional). Using Stage 2 ESD might be better.")
+                
+                # Create streaming progress UI FIRST so we can pass callback to dataset
+                streaming_progress = StreamingProgressUI(
+                    message="Streaming from HuggingFace...",
+                    console=self.ui.console
+                )
+                streaming_progress.start()
+                
+                # Define callback that updates progress
+                def on_sample_received(count: int):
+                    streaming_progress.set_samples(count)
                 
                 # Emilia is IterableDataset
                 dataset_create_start = time.perf_counter()
@@ -1462,6 +1490,7 @@ class DurationTrainer:
                     num_shards=getattr(self.config, 'emilia_shards', 50),
                     split="train",
                     max_samples=10000 if self.config.debug else None,
+                    on_sample_callback=on_sample_received,
                 )
                 dataset_create_duration = time.perf_counter() - dataset_create_start
                 logger.debug(f"[train] EmiliaDataset created in {dataset_create_duration:.2f}s")
@@ -1535,7 +1564,39 @@ class DurationTrainer:
             self.loss_history = checkpoint_info.get("loss_history", [])
             logger.info(f"Resumed from step {self.step}")
 
-        # Start UI
+        # Check if streaming dataset
+        is_streaming = isinstance(dataset, IterableDataset)
+        
+        # For streaming datasets, wait for first batch before starting full UI
+        # streaming_progress was already created in the dataset section if emilia
+        first_batch_received = False
+        first_batch = None
+        
+        if is_streaming and streaming_progress:
+            # Get the first batch to confirm connection is working
+            # The progress UI is already showing and will update via callbacks
+            logger.info("Waiting for first batch from streaming dataset...")
+            logger.info("(This may take several minutes due to network latency)")
+            
+            try:
+                start_time = time.perf_counter()
+                dataloader_iter = iter(dataloader)
+                first_batch = next(dataloader_iter)
+                batch_fetch_time = time.perf_counter() - start_time
+                first_batch_received = True
+                
+                streaming_progress.stop(success=True)
+                streaming_progress = None
+                
+                logger.info(f"✓ First batch received! (took {batch_fetch_time:.1f}s)")
+            except StopIteration:
+                streaming_progress.stop(success=False)
+                raise RuntimeError("Streaming dataset returned no data")
+            except Exception as e:
+                streaming_progress.stop(success=False)
+                raise
+        
+        # NOW start the main training UI (after streaming connection confirmed)
         self.ui.start()
         self.ui.update(
             stage=self.config.stage,
@@ -1552,8 +1613,6 @@ class DurationTrainer:
             self.model.train()
             start_time = time.perf_counter()
             tokens_processed = 0
-            is_streaming = isinstance(dataset, IterableDataset)
-            first_batch_received = False
             
             logger.debug(f"[train] Starting training loop - is_streaming={is_streaming}")
             logger.debug(f"[train] Dataloader config: batch_size={self.config.batch_size}, workers={self.config.num_workers}")
@@ -1563,33 +1622,21 @@ class DurationTrainer:
                 logger.info(f"Starting epoch {self.epoch + 1}/{self.config.num_epochs}")
                 epoch_start_time = time.perf_counter()
                 
-                if is_streaming and not first_batch_received:
-                    # Show buffering message for streaming datasets
-                    logger.info("Waiting for first batch from streaming dataset...")
-                    logger.info("(This may take several minutes due to network latency)")
-                    logger.debug("[train] About to enter 'for batch in dataloader' loop...")
-                    self.ui.console.print(
-                        f"\n[cyan]⟳[/cyan] [bold]Buffering streaming data...[/bold]\n"
-                        f"[dim]Connecting to HuggingFace Hub. First batch may take a few minutes.[/dim]\n"
-                    )
-                
                 batch_idx = 0
                 logger.debug(f"[train] Creating dataloader iterator for epoch {self.epoch + 1}...")
-                dataloader_iter_start = time.perf_counter()
                 
-                for batch in dataloader:
+                # For streaming datasets on first epoch, we already have the first batch
+                # Create an iterator that yields the pre-fetched batch first
+                if is_streaming and first_batch is not None:
+                    # Chain: first the pre-fetched batch, then the rest of the dataloader
+                    import itertools
+                    batch_iterator = itertools.chain([first_batch], dataloader_iter)
+                    first_batch = None  # Clear so we don't reuse it
+                else:
+                    batch_iterator = iter(dataloader)
+                
+                for batch in batch_iterator:
                     batch_idx += 1
-                    
-                    # Log first batch received
-                    if not first_batch_received:
-                        first_batch_received = True
-                        batch_fetch_time = time.perf_counter() - start_time
-                        logger.info(f"✓ First batch received! (took {batch_fetch_time:.1f}s)")
-                        logger.debug(f"[train] First batch keys: {list(batch.keys())}")
-                        logger.debug(f"[train] First batch shapes: semantic_tokens={batch['semantic_tokens'].shape}")
-                        self.ui.console.print(
-                            f"[green]✓[/green] First batch received after {batch_fetch_time:.1f}s - training started!\n"
-                        )
                     
                     # Periodic debug logging
                     if batch_idx % 50 == 0:
