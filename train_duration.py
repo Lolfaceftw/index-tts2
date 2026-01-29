@@ -28,15 +28,11 @@ import argparse
 import functools
 import logging
 import os
-import random
-import signal
-import sys
-import time
-from dataclasses import dataclass, field
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+from indextts.utils.logger import logger_manager
 
 import numpy as np
 import torch
@@ -85,38 +81,7 @@ except ImportError:
 # OBSERVABILITY SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-
-def setup_observability(debug_mode: bool = False) -> logging.Logger:
-    """Initialize file-based logging for training.
-
-    Args:
-        debug_mode: If True, set log level to DEBUG.
-
-    Returns:
-        Configured logger instance.
-
-    Example:
-        >>> logger = setup_observability(debug_mode=True)
-        >>> logger.info("Training started")
-    """
-    log_level = logging.DEBUG if debug_mode else logging.INFO
-    logger = logging.getLogger("train_duration")
-    logger.setLevel(log_level)
-
-    if not logger.handlers:
-        handler = RotatingFileHandler(
-            "train_duration.log", maxBytes=10 * 1024 * 1024, backupCount=3
-        )
-        formatter = logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-    return logger
-
-
-logger = setup_observability()
+logger = logger_manager.get_logger()
 
 
 def trace_execution(func):
@@ -1765,28 +1730,16 @@ def download_emilia_dataset(
     except ImportError:
         raise ImportError("huggingface_hub required: pip install huggingface_hub")
     
-    from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn
+    logger.info("Emilia Dataset Downloader")
+    logger.info(f"  Language: {language}")
+    logger.info(f"  Shards:   {num_shards}")
+    logger.info(f"  Pattern:  {patterns[0]} ... {patterns[-1]}")
     
-    console = Console()
-    
-    # Generate shard patterns
-    # Format: Emilia/EN/EN-B000000.tar to EN-B000049.tar (for 50 shards)
-    patterns = [f"Emilia/{language}/{language}-B0000{i:02d}.tar" for i in range(num_shards)]
-    
-    console.print(f"\n[bold cyan]Emilia Dataset Downloader[/bold cyan]")
-    console.print(f"[dim]─" * 50 + "[/dim]")
-    console.print(f"  Language: [bold]{language}[/bold]")
-    console.print(f"  Shards:   [bold]{num_shards}[/bold]")
-    console.print(f"  Pattern:  [dim]{patterns[0]}[/dim] ... [dim]{patterns[-1]}[/dim]")
-    console.print(f"[dim]─" * 50 + "[/dim]\n")
-    
-    console.print("[yellow]⚠[/yellow] Make sure you have access to the gated dataset:")
-    console.print("  [link]https://huggingface.co/datasets/amphion/Emilia-Dataset[/link]\n")
-    console.print("[dim]Run 'huggingface-cli login' if you haven't authenticated.[/dim]\n")
+    logger.warning("Make sure you have access to the gated dataset: https://huggingface.co/datasets/amphion/Emilia-Dataset")
+    logger.info("Run 'huggingface-cli login' if you haven't authenticated.")
     
     try:
-        console.print("[cyan]⟳[/cyan] Starting download...")
+        logger.info("Starting download...")
         
         result = snapshot_download(
             repo_id="amphion/Emilia-Dataset",
@@ -1795,16 +1748,16 @@ def download_emilia_dataset(
             cache_dir=cache_dir,
         )
         
-        console.print(f"\n[green]✓[/green] [bold]Download complete![/bold]")
-        console.print(f"  Cache location: [dim]{result}[/dim]")
-        console.print(f"\n[dim]You can now run training with --dataset emilia[/dim]\n")
+        logger.info("Download complete!")
+        logger.info(f"  Cache location: {result}")
+        logger.info("You can now run training with --dataset emilia")
         
     except Exception as e:
-        console.print(f"\n[red]✗[/red] Download failed: {e}")
-        console.print("\n[yellow]Troubleshooting:[/yellow]")
-        console.print("  1. Run: [bold]huggingface-cli login[/bold]")
-        console.print("  2. Request access at: [link]https://huggingface.co/datasets/amphion/Emilia-Dataset[/link]")
-        console.print("  3. Check your internet connection")
+        logger.error(f"Download failed: {e}")
+        logger.info("Troubleshooting:")
+        logger.info("  1. Run: huggingface-cli login")
+        logger.info("  2. Request access at: https://huggingface.co/datasets/amphion/Emilia-Dataset")
+        logger.info("  3. Check your internet connection")
         raise
 
 
@@ -1884,6 +1837,14 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # Initialize Central Logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logger_manager.setup(
+        name="train_duration",
+        log_file="train_duration.log",
+        level=log_level
+    )
 
     # Demo mode
     if args.demo_ui:

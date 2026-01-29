@@ -19,49 +19,23 @@ import subprocess
 import tempfile
 import time
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Union
 
 import numpy as np
 import torch
 
+from indextts.utils.logger import logger_manager
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OBSERVABILITY SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def setup_observability(debug_mode: bool = False) -> logging.Logger:
-    """Initialize file-based logging for checkpoint operations.
-
-    Args:
-        debug_mode (bool): If True, set log level to DEBUG.
-
-    Returns:
-        logging.Logger: Configured logger instance.
-
-    Example:
-        >>> logger = setup_observability(debug_mode=True)
-        >>> logger.debug("Checkpoint saved")
-    """
-    log_level = logging.DEBUG if debug_mode else logging.INFO
-    logger = logging.getLogger("checkpoint_manager")
-    logger.setLevel(log_level)
-
-    if not logger.handlers:
-        handler = RotatingFileHandler(
-            "checkpoint_manager.log", maxBytes=5 * 1024 * 1024, backupCount=2
-        )
-        formatter = logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-    return logger
-
-
-logger = setup_observability()
+logger = logger_manager.get_logger()
+# Initialize with defaults if not already done, but usually done by the main script.
+if not logger.handlers:
+    logger = logger_manager.setup(name="checkpoint_manager", log_file="checkpoint_manager.log")
 
 
 def trace_execution(func):
@@ -293,10 +267,13 @@ class CheckpointManager:
         """
         global logger
         if debug:
-            logger = setup_observability(debug_mode=True)
-
-        if max_checkpoints < 1:
-            raise ValueError("max_checkpoints must be at least 1.")
+            logger = logger_manager.setup(
+                name="checkpoint_manager", 
+                log_file="checkpoint_manager.log",
+                level=logging.DEBUG
+            )
+        else:
+            logger = logger_manager.get_logger()
 
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
